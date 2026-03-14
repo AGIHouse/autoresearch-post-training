@@ -350,41 +350,55 @@ class SandboxPool:
 # Dataset — MBPP++ (EvalPlus)
 # =============================================================================
 
+# MBPP original splits: train=task_id 11-510, test=task_id 511-974
+_MBPP_TRAIN_MAX_ID = 510
+
+
+def _parse_task_id(task_id: str) -> int:
+    """Extract numeric ID from 'Mbpp/123' format."""
+    return int(task_id.split("/")[1])
+
+
+def _format_problem(task_id: str, problem: dict) -> dict:
+    """Format a single MBPP++ problem into prompt + test_list + setup_code."""
+    assertion_str = problem.get("assertion", "")
+    test_list = [line.strip() for line in assertion_str.strip().split("\n") if line.strip()]
+    prompt = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": problem["prompt"]},
+    ]
+    return {
+        "task_id": task_id,
+        "prompt": prompt,
+        "test_list": test_list,
+        "setup_code": "",
+    }
+
+
 def load_mbpp_plus_for_grpo() -> Dataset:
     """
-    Load MBPP++ (EvalPlus) and format for GRPOTrainer.
+    Load MBPP++ train split (task_id <= 510) and format for GRPOTrainer.
 
-    MBPP++ provides 35x more test cases than original MBPP (378 tasks).
-    Uses evalplus.data.get_mbpp_plus() to load the augmented dataset.
+    Uses the standard MBPP train/test split: train=11-510, test=511-974.
 
     Returns:
         HuggingFace Dataset with columns: prompt, test_list, test_setup_code
     """
-    logger.info("Loading MBPP++ from EvalPlus...")
+    logger.info("Loading MBPP++ train split from EvalPlus...")
     mbpp_data = get_mbpp_plus()
-    logger.info(f"Loaded {len(mbpp_data)} MBPP++ problems")
 
     prompts = []
     test_lists = []
     test_setup_codes = []
 
     for task_id, problem in mbpp_data.items():
-        # MBPP++ "prompt" already includes the task description and sample assertions
-        task_desc = problem["prompt"]
+        if _parse_task_id(task_id) > _MBPP_TRAIN_MAX_ID:
+            continue
 
-        # "assertion" is a multiline string of assert statements
-        assertion_str = problem.get("assertion", "")
-        test_list = [line.strip() for line in assertion_str.strip().split("\n") if line.strip()]
-
-        # Use the prompt directly — it already contains sample test cases
-        prompt = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task_desc},
-        ]
-
-        prompts.append(prompt)
-        test_lists.append(test_list)
-        test_setup_codes.append("")  # MBPP++ doesn't have separate setup code
+        formatted = _format_problem(task_id, problem)
+        prompts.append(formatted["prompt"])
+        test_lists.append(formatted["test_list"])
+        test_setup_codes.append(formatted["setup_code"])
 
     dataset = Dataset.from_dict({
         "prompt": prompts,
@@ -392,39 +406,37 @@ def load_mbpp_plus_for_grpo() -> Dataset:
         "test_setup_code": test_setup_codes,
     })
 
-    logger.info(f"Formatted {len(dataset)} MBPP++ problems for GRPO")
+    logger.info(f"Formatted {len(dataset)} MBPP++ train problems for GRPO")
     return dataset
 
 
 def load_mbpp_plus_test() -> tuple[list[list[dict]], list[dict]]:
     """
-    Load MBPP++ for evaluation. Returns (prompts, metadata).
+    Load MBPP++ test split (task_id > 510) for evaluation.
 
-    prompts: list of conversation messages (OpenAI format)
-    metadata: list of dicts with task_id, tests, setup_code
+    Returns:
+        (prompts, metadata) where prompts are OpenAI-format messages
+        and metadata contains task_id, tests, setup_code per problem.
     """
-    logger.info("Loading MBPP++ for evaluation...")
+    logger.info("Loading MBPP++ test split for evaluation...")
     mbpp_data = get_mbpp_plus()
 
     prompts = []
     metadata = []
 
     for task_id, problem in mbpp_data.items():
-        assertion_str = problem.get("assertion", "")
-        test_list = [line.strip() for line in assertion_str.strip().split("\n") if line.strip()]
+        if _parse_task_id(task_id) <= _MBPP_TRAIN_MAX_ID:
+            continue
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": problem["prompt"]},
-        ]
-        prompts.append(messages)
+        formatted = _format_problem(task_id, problem)
+        prompts.append(formatted["prompt"])
         metadata.append({
             "task_id": task_id,
-            "tests": test_list,
-            "setup_code": "",
+            "tests": formatted["test_list"],
+            "setup_code": formatted["setup_code"],
         })
 
-    logger.info(f"Built {len(prompts)} MBPP++ evaluation prompts")
+    logger.info(f"Built {len(prompts)} MBPP++ test evaluation prompts")
     return prompts, metadata
 
 
