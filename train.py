@@ -17,28 +17,27 @@ Usage:
 import argparse
 import logging
 import os
+import subprocess
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import torch
 import yaml
 from peft import LoraConfig, TaskType
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from trl import GRPOConfig, GRPOTrainer
 
-import subprocess
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 from prepare import (
     SandboxPool,
-    load_mbpp_plus_test,
     code_execution_reward,
     evaluate_solutions,
-    extract_code_from_completion,
     format_reward,
+    generate_batch_vllm,
     load_mbpp_plus_for_grpo,
+    load_mbpp_plus_test,
+    merge_adapter,
     set_reward_mode,
     set_sandbox_pool,
     set_seed,
@@ -461,9 +460,9 @@ def main():
         f"{config.per_device_train_batch_size * config.gradient_accumulation_steps} prompts/step | "
         f"Completions/step: {config.per_device_train_batch_size * config.gradient_accumulation_steps * config.num_generations}"
     )
+    train_start = time.time()
     trainer.train()
-
-    training_seconds = time.time() - start_time
+    training_seconds = time.time() - train_start
 
     # ── Save ──────────────────────────────────────────────────────────────
     final_path = f"{config.output_dir}/final"
@@ -471,24 +470,33 @@ def main():
     logger.info(f"Model saved to {final_path}")
 
     # ── Evaluate ──────────────────────────────────────────────────────────
+    # Save step count before freeing trainer
+    num_steps = trainer.state.global_step
+
+    # Free training GPU memory before loading vLLM for eval
+    del trainer
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
     memory_gb = round(peak_vram_mb / 1024, 1)
 
     logger.info("Running evaluation on MBPP++...")
     prompts, metadata = load_mbpp_plus_test()
 
-    # Evaluate baseline
+    # Evaluate baseline using vLLM batched inference
     logger.info(f"Evaluating baseline: {config.model_name}")
-    baseline_completions = generate_completions(
+    baseline_completions = generate_batch_vllm(
         config.model_name, prompts, max_tokens=config.max_completion_length,
     )
     baseline_results = evaluate_solutions(baseline_completions, metadata, pool)
 
-    # Evaluate trained model (merge LoRA adapter first)
-    from prepare import merge_adapter
+    # Evaluate trained model (merge LoRA adapter, then vLLM inference)
     merged_path = merge_adapter(final_path, config.model_name, config.output_dir)
     logger.info(f"Evaluating trained model: {merged_path}")
-    trained_completions = generate_completions(
+    trained_completions = generate_batch_vllm(
         merged_path, prompts, max_tokens=config.max_completion_length,
     )
     trained_results = evaluate_solutions(trained_completions, metadata, pool)
@@ -519,7 +527,7 @@ def main():
     print(f"total_seconds:      {total_seconds:.1f}")
     print(f"peak_vram_mb:       {peak_vram_mb:.1f}")
     print(f"memory_gb:          {memory_gb}")
-    print(f"num_steps:          {trainer.state.global_step}")
+    print(f"num_steps:          {num_steps}")
     print(f"model:              {config.model_name}")
 
     # ── Write results.tsv ─────────────────────────────────────────────────
@@ -547,72 +555,6 @@ def main():
 
     logger.info(f"Results written to {tsv_path}")
     logger.info("Training complete!")
-
-
-def generate_completions(
-    model_path: str,
-    prompts: list[list[dict]],
-    max_tokens: int = 1024,
-) -> list[str]:
-    """Generate completions using transformers (not vLLM) for evaluation."""
-    import gc
-
-    logger.info(f"Loading model for eval: {model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    completions = []
-    batch_size = 4
-    for i in range(0, len(prompts), batch_size):
-        batch = prompts[i:i + batch_size]
-
-        # Format prompts using chat template
-        texts = []
-        for messages in batch:
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-            texts.append(text)
-
-        inputs = tokenizer(
-            texts, return_tensors="pt", padding=True, truncation=True,
-            max_length=2048,
-        ).to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                temperature=1.0,
-                do_sample=False,  # greedy for deterministic eval
-                pad_token_id=tokenizer.pad_token_id,
-            )
-
-        for j, output in enumerate(outputs):
-            # Decode only the new tokens
-            input_len = inputs["input_ids"][j].shape[0]
-            completion = tokenizer.decode(output[input_len:], skip_special_tokens=True)
-            completions.append(completion)
-
-        if (i + batch_size) % 50 == 0 or i + batch_size >= len(prompts):
-            logger.info(f"  Generated {min(i + batch_size, len(prompts))}/{len(prompts)}")
-
-    # Free memory
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return completions
 
 
 if __name__ == "__main__":
