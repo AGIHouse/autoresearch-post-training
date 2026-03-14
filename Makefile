@@ -1,4 +1,10 @@
-.PHONY: sandbox install train eval eval-baseline eval-trained compare test clean
+GPU_HOST := root@165.245.141.38
+
+.PHONY: ssh sandbox install train eval eval-baseline eval-trained compare test clean
+
+# SSH into the GPU instance
+ssh:
+	ssh $(GPU_HOST)
 
 # Build the Docker sandbox image
 sandbox:
@@ -6,8 +12,8 @@ sandbox:
 
 # Install project dependencies (bootstraps uv if missing)
 install:
-	@command -v uv >/dev/null 2>&1 || { echo "Installing uv..."; curl -LsSf https://astral.sh/uv/install.sh | sh; }
-	uv sync --all-extras
+	@command -v uv >/dev/null 2>&1 || { echo "Installing uv..."; curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$$HOME/.local/bin:$$PATH"; }
+	PATH="$$HOME/.local/bin:$$PATH" uv sync --all-extras
 
 # Run GRPO training with dr_grpo config
 train:
