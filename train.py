@@ -17,6 +17,7 @@ Usage:
 import argparse
 import logging
 import os
+import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -81,6 +82,9 @@ class TrainingConfig:
     vllm_mode: str = "colocate"
     vllm_gpu_memory_utilization: float = 0.45
     vllm_sleep_enabled: bool = False
+
+    # Time budget
+    time_budget_seconds: int = 300  # 5 minute wall-clock hard limit
 
     # Training
     bf16: bool = True
@@ -295,6 +299,24 @@ class CompletionLengthMonitor(TrainerCallback):
             self._alerted_explosion = True
 
 
+class TimeBudgetCallback(TrainerCallback):
+    """Hard stop after time_budget_seconds of wall-clock training time."""
+
+    def __init__(self, time_budget_seconds: int = 300):
+        self.time_budget_seconds = time_budget_seconds
+        self._start_time: float | None = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._start_time = time.time()
+        logger.info(f"Time budget: {self.time_budget_seconds}s ({self.time_budget_seconds / 60:.0f} min)")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        elapsed = time.time() - self._start_time
+        if elapsed >= self.time_budget_seconds:
+            logger.info(f"Time budget reached ({elapsed:.1f}s). Stopping training.")
+            control.should_training_stop = True
+
+
 # =============================================================================
 # Training
 # =============================================================================
@@ -401,6 +423,7 @@ def main():
 
     # ── Configure callbacks ────────────────────────────────────────────────
     callbacks = [
+        TimeBudgetCallback(time_budget_seconds=config.time_budget_seconds),
         SampleLoggerCallback(log_every_n_steps=10, num_samples=4),
         RewardStatsCallback(),
         EarlyStoppingCallback(patience=200, min_reward_threshold=-0.3),
