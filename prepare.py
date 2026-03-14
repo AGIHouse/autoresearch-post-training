@@ -637,7 +637,9 @@ def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
         idx = output.request_id
         results[int(idx)] = output.outputs[0].text
 
-    # Free GPU memory
+    # Free GPU memory — must shut down vLLM engine to release CUDA contexts
+    from vllm.distributed.parallel_state import destroy_model_parallel
+    destroy_model_parallel()
     del llm
     gc.collect()
     if torch.cuda.is_available():
