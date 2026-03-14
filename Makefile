@@ -4,8 +4,9 @@
 sandbox:
 	docker build -t coding-sandbox:latest -f docker/Dockerfile.sandbox docker/
 
-# Install project dependencies
+# Install project dependencies (bootstraps uv if missing)
 install:
+	@command -v uv >/dev/null 2>&1 || { echo "Installing uv..."; curl -LsSf https://astral.sh/uv/install.sh | sh; }
 	uv sync --all-extras
 
 # Run GRPO training with dr_grpo config
