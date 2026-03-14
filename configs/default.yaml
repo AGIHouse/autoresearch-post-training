@@ -1,9 +1,9 @@
 # Default training configuration for GRPO coding agent on MBPP++
 #
-# Recommended defaults for Qwen3.5-0.8B-Base + LoRA + GRPO.
+# Recommended defaults for Qwen2.5-Coder-0.5B + LoRA + GRPO.
 
 # Model
-model_name: "Qwen/Qwen3.5-0.8B-Base"
+model_name: "Qwen/Qwen2.5-Coder-0.5B"
 
 # LoRA
 lora_r: 64
