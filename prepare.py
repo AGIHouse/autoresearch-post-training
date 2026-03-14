@@ -369,24 +369,22 @@ def load_mbpp_plus_for_grpo() -> Dataset:
     test_setup_codes = []
 
     for task_id, problem in mbpp_data.items():
+        # MBPP++ "prompt" already includes the task description and sample assertions
         task_desc = problem["prompt"]
-        tests = problem["test_list"]
-        test_imports = problem.get("test_imports", [])
 
-        # Include test cases in prompt so model knows expected function signature
-        tests_str = "\n".join(tests)
-        user_content = f"{task_desc}\n\nYour code must satisfy these test cases:\n{tests_str}"
+        # "assertion" is a multiline string of assert statements
+        assertion_str = problem.get("assertion", "")
+        test_list = [line.strip() for line in assertion_str.strip().split("\n") if line.strip()]
 
+        # Use the prompt directly — it already contains sample test cases
         prompt = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": task_desc},
         ]
 
-        setup_code = "\n".join(test_imports) if test_imports else ""
-
         prompts.append(prompt)
-        test_lists.append(tests)
-        test_setup_codes.append(setup_code)
+        test_lists.append(test_list)
+        test_setup_codes.append("")  # MBPP++ doesn't have separate setup code
 
     dataset = Dataset.from_dict({
         "prompt": prompts,
@@ -412,20 +410,18 @@ def load_mbpp_plus_test() -> tuple[list[list[dict]], list[dict]]:
     metadata = []
 
     for task_id, problem in mbpp_data.items():
-        tests = problem["test_list"]
-        test_imports = problem.get("test_imports", [])
-        tests_str = "\n".join(tests)
-        user_content = f"{problem['prompt']}\n\nYour code must satisfy these test cases:\n{tests_str}"
+        assertion_str = problem.get("assertion", "")
+        test_list = [line.strip() for line in assertion_str.strip().split("\n") if line.strip()]
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": problem["prompt"]},
         ]
         prompts.append(messages)
         metadata.append({
             "task_id": task_id,
-            "tests": tests,
-            "setup_code": "\n".join(test_imports) if test_imports else "",
+            "tests": test_list,
+            "setup_code": "",
         })
 
     logger.info(f"Built {len(prompts)} MBPP++ evaluation prompts")
