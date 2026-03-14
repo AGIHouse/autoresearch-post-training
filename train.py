@@ -27,9 +27,16 @@ from peft import LoraConfig, TaskType
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from trl import GRPOConfig, GRPOTrainer
 
+import subprocess
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from prepare import (
     SandboxPool,
+    build_prompts_mbpp_plus,
     code_execution_reward,
+    evaluate_solutions,
+    extract_code_from_completion,
     format_reward,
     load_mbpp_plus_for_grpo,
     set_reward_mode,
@@ -378,6 +385,7 @@ def main():
     args = parser.parse_args()
 
     # ── Setup ──────────────────────────────────────────────────────────────
+    start_time = time.time()
     setup_logging()
 
     if args.config:
@@ -455,11 +463,156 @@ def main():
     )
     trainer.train()
 
+    training_seconds = time.time() - start_time
+
     # ── Save ──────────────────────────────────────────────────────────────
     final_path = f"{config.output_dir}/final"
     trainer.save_model(final_path)
     logger.info(f"Model saved to {final_path}")
+
+    # ── Evaluate ──────────────────────────────────────────────────────────
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
+    memory_gb = round(peak_vram_mb / 1024, 1)
+
+    logger.info("Running evaluation on MBPP++...")
+    prompts, metadata = build_prompts_mbpp_plus()
+
+    # Evaluate baseline
+    logger.info(f"Evaluating baseline: {config.model_name}")
+    baseline_completions = generate_completions(
+        config.model_name, prompts, max_tokens=config.max_completion_length,
+    )
+    baseline_results = evaluate_solutions(baseline_completions, metadata, pool)
+
+    # Evaluate trained model (merge LoRA adapter first)
+    from prepare import merge_adapter
+    merged_path = merge_adapter(final_path, config.model_name, config.output_dir)
+    logger.info(f"Evaluating trained model: {merged_path}")
+    trained_completions = generate_completions(
+        merged_path, prompts, max_tokens=config.max_completion_length,
+    )
+    trained_results = evaluate_solutions(trained_completions, metadata, pool)
+
+    total_seconds = time.time() - start_time
+
+    # ── Print summary ─────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS (MBPP++)")
+    print("=" * 60)
+    print(f"{'Metric':<25} {'Baseline':>12} {'Trained':>12} {'Delta':>12}")
+    print("-" * 60)
+    b_pass = baseline_results["pass_at_1"]
+    t_pass = trained_results["pass_at_1"]
+    delta = t_pass - b_pass
+    print(f"{'pass@1':<25} {b_pass:>11.1%} {t_pass:>11.1%} {delta:>+11.1%}")
+    print(f"{'passed':<25} {baseline_results['passed']:>12} {trained_results['passed']:>12} {trained_results['passed'] - baseline_results['passed']:>+12}")
+    print(f"{'total':<25} {baseline_results['total']:>12} {trained_results['total']:>12}")
+    print("=" * 60)
+    print()
+
+    # Karpathy-style summary
+    print("---")
+    print(f"baseline_pass_at_1: {b_pass:.6f}")
+    print(f"trained_pass_at_1:  {t_pass:.6f}")
+    print(f"delta_pass_at_1:    {delta:+.6f}")
+    print(f"training_seconds:   {training_seconds:.1f}")
+    print(f"total_seconds:      {total_seconds:.1f}")
+    print(f"peak_vram_mb:       {peak_vram_mb:.1f}")
+    print(f"memory_gb:          {memory_gb}")
+    print(f"num_steps:          {trainer.state.global_step}")
+    print(f"model:              {config.model_name}")
+
+    # ── Write results.tsv ─────────────────────────────────────────────────
+    tsv_path = "results.tsv"
+    write_header = not os.path.exists(tsv_path)
+
+    # Get current git commit
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        commit = "unknown"
+
+    status = "keep" if delta > 0 else "discard"
+
+    with open(tsv_path, "a") as f:
+        if write_header:
+            f.write("commit\tpass_at_1\tmemory_gb\tstatus\tdescription\n")
+            # Write baseline row
+            f.write(f"{commit}\t{b_pass:.6f}\t{memory_gb}\tkeep\tbaseline ({config.model_name})\n")
+        # Write trained row
+        f.write(f"{commit}\t{t_pass:.6f}\t{memory_gb}\t{status}\ttrained (delta={delta:+.4f})\n")
+
+    logger.info(f"Results written to {tsv_path}")
     logger.info("Training complete!")
+
+
+def generate_completions(
+    model_path: str,
+    prompts: list[list[dict]],
+    max_tokens: int = 1024,
+) -> list[str]:
+    """Generate completions using transformers (not vLLM) for evaluation."""
+    import gc
+
+    logger.info(f"Loading model for eval: {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    completions = []
+    batch_size = 4
+    for i in range(0, len(prompts), batch_size):
+        batch = prompts[i:i + batch_size]
+
+        # Format prompts using chat template
+        texts = []
+        for messages in batch:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            texts.append(text)
+
+        inputs = tokenizer(
+            texts, return_tensors="pt", padding=True, truncation=True,
+            max_length=2048,
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=1.0,
+                do_sample=False,  # greedy for deterministic eval
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        for j, output in enumerate(outputs):
+            # Decode only the new tokens
+            input_len = inputs["input_ids"][j].shape[0]
+            completion = tokenizer.decode(output[input_len:], skip_special_tokens=True)
+            completions.append(completion)
+
+        if (i + batch_size) % 50 == 0 or i + batch_size >= len(prompts):
+            logger.info(f"  Generated {min(i + batch_size, len(prompts))}/{len(prompts)}")
+
+    # Free memory
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return completions
 
 
 if __name__ == "__main__":
