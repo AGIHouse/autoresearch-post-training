@@ -572,6 +572,69 @@ def format_reward(
 # Evaluation
 # =============================================================================
 
+def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
+                        max_tokens: int = 1024) -> list[str]:
+    """
+    Generate solutions for all prompts using vLLM batched inference.
+
+    Args:
+        model_path: Path to model or HF model ID
+        prompts: List of conversation messages (OpenAI format)
+        max_tokens: Max new tokens per completion
+
+    Returns:
+        List of generated text strings
+    """
+    import gc
+    import os
+    from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
+
+    # vLLM needs absolute paths for local models
+    if os.path.exists(model_path):
+        model_path = os.path.abspath(model_path)
+
+    logger.info(f"Loading model into vLLM: {model_path}")
+    llm = LLM(
+        model=model_path,
+        dtype="bfloat16",
+        max_model_len=4096,
+        gpu_memory_utilization=0.9,
+        trust_remote_code=True,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    # Format prompts using chat template
+    formatted = []
+    for messages in prompts:
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        formatted.append(text)
+
+    sampling_params = SamplingParams(
+        temperature=0,  # greedy for deterministic eval
+        max_tokens=max_tokens,
+    )
+
+    logger.info(f"Generating {len(formatted)} completions with vLLM...")
+    outputs = llm.generate(formatted, sampling_params)
+
+    # Extract generated text, sorted by request order
+    results = [""] * len(formatted)
+    for output in outputs:
+        idx = output.request_id
+        results[int(idx)] = output.outputs[0].text
+
+    # Free GPU memory
+    del llm
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info("Generation complete")
+    return results
+
+
 def merge_adapter(model_path: str, base_model: str, output_dir: str) -> str:
     """Merge a LoRA adapter into the base model and save. Returns path to merged model."""
     import gc
