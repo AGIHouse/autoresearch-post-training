@@ -1,0 +1,34 @@
+# Experiment 2: Subprocess sandbox (additive on baseline)
+# Change: sandbox_backend docker -> subprocess
+
+model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+loss_type: "dr_grpo"
+beta: 0.0
+scale_rewards: false
+reward_mode: "binary"
+reward_weights: [1.0, 0.1]
+
+num_generations: 8
+max_prompt_length: 512
+max_completion_length: 1024
+temperature: 0.9
+learning_rate: 5.0e-6
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+max_steps: 999
+warmup_steps: 2
+
+lora_r: 64
+lora_alpha: 128
+bf16: true
+gradient_checkpointing: true
+use_vllm: true
+vllm_mode: "colocate"
+vllm_gpu_memory_utilization: 0.3
+
+dataset_name: "rlvr"
+sandbox_backend: "subprocess"
+output_dir: "./outputs/bench2"
+wandb_project: "coding-agent-rl-bench"
+logging_steps: 1
+save_steps: 9999

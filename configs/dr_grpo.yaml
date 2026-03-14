@@ -1,0 +1,47 @@
+# Dr. GRPO configuration — removes length and std normalization biases
+#
+# Based on findings from DeepSWE (Together AI) and Dr.GRPO paper:
+# - Standard GRPO's length normalization biases toward verbose incorrect answers
+# - Std normalization over-weights trivially easy or hard questions
+# - Binary rewards work better than partial credit for coding tasks
+# - No KL penalty needed with verifiable rewards
+#
+# Use this config when you observe:
+# - Response length inflation during training
+# - Model gaming partial credit without actual correctness
+# - Training instability from std normalization on easy/hard batches
+
+# Model
+model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+
+# GRPO — key differences from default
+loss_type: "dr_grpo"    # Removes length and std normalization
+beta: 0.0               # No KL penalty
+scale_rewards: false     # Don't normalize by std (Dr.GRPO recommendation)
+
+# Binary rewards (DeepSWE finding: sparse > dense for coding)
+reward_mode: "binary"
+reward_weights:
+  - 1.0
+  - 0.1
+
+# Everything else same as default
+num_generations: 8
+max_prompt_length: 512
+max_completion_length: 1024
+temperature: 0.9
+learning_rate: 5.0e-6
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+max_steps: 200
+lora_r: 64
+lora_alpha: 128
+bf16: true
+gradient_checkpointing: true
+use_vllm: true
+vllm_mode: "colocate"
+vllm_gpu_memory_utilization: 0.45
+dataset_name: "rlvr"
+sandbox_backend: "subprocess"   # 12% faster than Docker, safe for training
+output_dir: "./outputs"
+wandb_project: "coding-agent-rl"

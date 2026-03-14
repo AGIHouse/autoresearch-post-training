@@ -1,0 +1,77 @@
+# Default training configuration for GRPO coding agent
+#
+# These are the recommended defaults for training Qwen2.5-Coder-7B-Instruct
+# with LoRA on a single A100 80GB GPU (GCP a2-highgpu-1g).
+#
+# Override any value by modifying this file or passing --config <your_file.yaml>
+#
+# Reference implementations:
+#   - Open-R1 (HuggingFace): binary rewards, E2B sandbox, vLLM colocate
+#   - DeepSWE (Together AI): binary rewards, no KL, dr_grpo loss
+#   - Modal GRPO example: binary rewards, Modal sandbox, OpenCoder dataset
+#   - AceCoder: partial rewards with 16+ test cases per problem
+
+# Model
+model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+
+# LoRA
+lora_r: 64
+lora_alpha: 128
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# GRPO
+num_generations: 8
+max_prompt_length: 512
+max_completion_length: 1024
+temperature: 0.9
+learning_rate: 5.0e-6
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+num_train_epochs: 3
+max_steps: 200
+beta: 0.0          # No KL penalty (per DeepSWE, Open-Reasoner-Zero)
+loss_type: "grpo"   # "grpo", "dr_grpo" (removes length/std bias), or "dapo"
+scale_rewards: true
+
+# vLLM
+use_vllm: true
+vllm_mode: "colocate"
+vllm_gpu_memory_utilization: 0.3
+
+# Training
+bf16: true
+gradient_checkpointing: true
+warmup_steps: 10
+weight_decay: 0.01
+max_grad_norm: 1.0
+save_steps: 50
+logging_steps: 1
+seed: 42
+
+# Sandbox
+sandbox_pool_size: 8
+sandbox_timeout: 10
+sandbox_memory_limit: "256m"
+sandbox_image: "coding-sandbox:latest"
+sandbox_backend: "auto"  # "auto" (tries Docker, falls back to subprocess), "docker", "subprocess"
+
+# Dataset
+dataset_name: "mbpp"  # "mbpp", "rlvr", or "opencoder"
+
+# Paths
+output_dir: "./outputs"
+wandb_project: "coding-agent-rl"
+
+# Reward
+reward_weights:  # [code_execution, format]
+  - 1.0
+  - 0.1
+reward_mode: "partial"  # "partial" (fractional credit) or "binary" (all-or-nothing)
