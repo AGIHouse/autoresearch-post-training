@@ -640,6 +640,7 @@ def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
     """
     import json
     import os
+    import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
     if os.path.exists(model_path):
@@ -648,7 +649,8 @@ def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
     logger.info(f"Loading model into vLLM (subprocess): {model_path}")
     prompts_json = json.dumps(prompts)
 
-    with ProcessPoolExecutor(max_workers=1) as executor:
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
         future = executor.submit(_generate_batch_vllm_worker, model_path, prompts_json, max_tokens)
         results_json = future.result()
 
