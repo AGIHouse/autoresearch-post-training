@@ -328,7 +328,6 @@ def build_grpo_config(config: TrainingConfig) -> GRPOConfig:
         use_vllm=config.use_vllm,
         vllm_mode=config.vllm_mode,
         vllm_gpu_memory_utilization=config.vllm_gpu_memory_utilization,
-        vllm_sleep_enabled=config.vllm_sleep_enabled,
         # Logging & saving
         logging_steps=config.logging_steps,
         save_steps=config.save_steps,
