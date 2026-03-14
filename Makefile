@@ -1,4 +1,4 @@
-GPU_HOST := root@165.245.141.38
+GPU_HOST := ubuntu@38.128.232.129
 
 .PHONY: ssh sandbox install train eval eval-baseline eval-trained compare test clean
 
