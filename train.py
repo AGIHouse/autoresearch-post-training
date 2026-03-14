@@ -33,7 +33,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from prepare import (
     SandboxPool,
-    build_prompts_mbpp_plus,
+    load_mbpp_plus_test,
     code_execution_reward,
     evaluate_solutions,
     extract_code_from_completion,
@@ -475,7 +475,7 @@ def main():
     memory_gb = round(peak_vram_mb / 1024, 1)
 
     logger.info("Running evaluation on MBPP++...")
-    prompts, metadata = build_prompts_mbpp_plus()
+    prompts, metadata = load_mbpp_plus_test()
 
     # Evaluate baseline
     logger.info(f"Evaluating baseline: {config.model_name}")
