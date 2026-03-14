@@ -17,7 +17,7 @@ install:
 
 # Run GRPO training with default config
 train:
-	uv run train.py --config configs/default.yaml
+	WANDB_MODE=disabled uv run train.py --config configs/default.yaml
 
 # Run training with built-in defaults
 train-default:
