@@ -1,9 +1,9 @@
-# Default training configuration for GRPO coding agent
+# Default training configuration for GRPO coding agent on MBPP++
 #
-# Recommended defaults for Qwen2.5-Coder-7B-Instruct + LoRA on single A100 80GB.
+# Recommended defaults for Qwen3.5-0.8B-Base + LoRA + GRPO.
 
 # Model
-model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+model_name: "Qwen/Qwen3.5-0.8B-Base"
 
 # LoRA
 lora_r: 64
@@ -35,7 +35,7 @@ scale_rewards: true
 # vLLM
 use_vllm: true
 vllm_mode: "colocate"
-vllm_gpu_memory_utilization: 0.3
+vllm_gpu_memory_utilization: 0.45
 
 # Training
 bf16: true
@@ -53,9 +53,6 @@ sandbox_timeout: 10
 sandbox_memory_limit: "256m"
 sandbox_image: "coding-sandbox:latest"
 sandbox_backend: "auto"
-
-# Dataset
-dataset_name: "mbpp"
 
 # Paths
 output_dir: "./outputs"

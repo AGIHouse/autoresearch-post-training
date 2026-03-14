@@ -15,11 +15,11 @@ install:
 	@command -v uv >/dev/null 2>&1 || { echo "Installing uv..."; curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$$HOME/.local/bin:$$PATH"; }
 	PATH="$$HOME/.local/bin:$$PATH" uv sync --all-extras
 
-# Run GRPO training with dr_grpo config
+# Run GRPO training with default config
 train:
-	uv run train.py --config configs/dr_grpo.yaml
+	uv run train.py --config configs/default.yaml
 
-# Run training with default config
+# Run training with built-in defaults
 train-default:
 	uv run train.py
 

@@ -1,6 +1,6 @@
 # autoresearch-post-training
 
-This is an experiment to have an LLM autonomously research post-training techniques for coding agents using GRPO (Group Relative Policy Optimization).
+This is an experiment to have an LLM autonomously research post-training techniques for coding agents using GRPO on MBPP++ (EvalPlus).
 
 ## Setup
 
@@ -10,9 +10,9 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
-   - `prepare.py` — fixed infrastructure: sandbox, dataset loading, reward functions, evaluation. Do not modify.
+   - `prepare.py` — fixed infrastructure: sandbox, MBPP++ dataset loading, reward functions, evaluation. Do not modify.
    - `train.py` — the file you modify. GRPO config, LoRA setup, callbacks, training loop.
-   - `configs/` — YAML config files (default.yaml, dr_grpo.yaml).
+   - `configs/default.yaml` — default hyperparameters.
 4. **Verify sandbox**: Check that Docker sandbox is built (`docker images | grep coding-sandbox`). If not, tell the human to run `make sandbox`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row.
 6. **Confirm and go**: Confirm setup looks good.
@@ -27,16 +27,15 @@ Each experiment runs on a single GPU. Launch with: `uv run train.py` or `uv run 
   - LoRA configuration (rank, alpha, target modules)
   - Training hyperparameters (LR, batch size, gradient accumulation)
   - Reward mode (partial vs binary)
-  - Dataset choice (mbpp, rlvr, opencoder)
   - Callbacks and monitoring
   - vLLM settings
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed sandbox, dataset loading, reward functions, and evaluation.
+- Modify `prepare.py`. It is read-only. It contains the fixed sandbox, MBPP++ dataset loading, reward functions, and evaluation.
 - Install new packages or add dependencies.
 - Modify the reward functions or evaluation harness.
 
-**The goal is simple: maximize pass@1 on the coding benchmarks.** Try different GRPO configurations, LoRA settings, reward modes, datasets, etc.
+**The goal is simple: maximize pass@1 on MBPP++.** Try different GRPO configurations, LoRA settings, reward modes, etc.
 
 **Simplicity criterion**: All else being equal, simpler is better.
 
