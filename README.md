@@ -1,25 +1,37 @@
 # autoresearch-post-training
 
-Autonomous AI agents conducting post-training research. Based on [karpathy/autoresearch](https://github.com/karpathy/autoresearch), adapted for post-training (SFT, DPO, RLHF).
+Autonomous AI agents conducting post-training research for coding agents. Based on [karpathy/autoresearch](https://github.com/karpathy/autoresearch), adapted for GRPO (Group Relative Policy Optimization) training.
 
-The agent modifies `train.py`, runs 5-minute experiments, and iterates to minimize `val_bpb`.
+The agent modifies `train.py`, runs experiments, and iterates to maximize coding benchmark performance (pass@1).
+
+## Architecture
+
+GRPO training loop (per step):
+1. Sample batch of coding prompts from dataset
+2. Generate G=8 completions per prompt using vLLM
+3. Execute each completion in a sandboxed environment against test cases
+4. Compute group-relative advantages
+5. Update policy using clipped surrogate objective
 
 ## Setup
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv sync
-uv run prepare.py      # download model + data (~5 min, one-time)
-uv run train.py        # ~5 min per experiment
+uv sync                       # install dependencies
+make sandbox                  # build Docker sandbox image
+uv run train.py               # run with defaults
+uv run train.py --config configs/dr_grpo.yaml  # run with Dr.GRPO config
 ```
 
 ## Structure
 
 | File | Role | Who edits |
 |------|------|-----------|
-| `prepare.py` | Data prep, evaluation, constants | Human only (read-only for agent) |
-| `train.py` | SFT/DPO training loop, hyperparams, LoRA config | Agent |
+| `prepare.py` | Sandbox, datasets, rewards, evaluation | Human only (read-only for agent) |
+| `train.py` | GRPO config, LoRA setup, callbacks, training loop | Agent |
 | `program.md` | Agent instructions | Human |
+| `configs/` | YAML config presets (default, dr_grpo) | Either |
+| `docker/` | Sandbox container (Dockerfile + runner) | Human only |
 
 ## How it works
 

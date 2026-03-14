@@ -1,0 +1,25 @@
+.PHONY: sandbox install train eval eval-baseline eval-trained compare test clean
+
+# Build the Docker sandbox image
+sandbox:
+	docker build -t coding-sandbox:latest -f docker/Dockerfile.sandbox docker/
+
+# Install project dependencies
+install:
+	uv sync --all-extras
+
+# Run GRPO training with dr_grpo config
+train:
+	uv run train.py --config configs/dr_grpo.yaml
+
+# Run training with default config
+train-default:
+	uv run train.py
+
+# Run unit tests
+test:
+	uv run pytest tests/ -v
+
+# Clean outputs
+clean:
+	rm -rf outputs/ wandb/ __pycache__

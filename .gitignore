@@ -8,9 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
 worktrees/
-results/
-queue/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
@@ -24,3 +23,18 @@ results.tsv
 
 # Logs
 run.log
+
+# Training outputs
+outputs/
+wandb/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store

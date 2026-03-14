@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+# Install minimal dependencies that MBPP problems might need
+RUN pip install --no-cache-dir numpy
+
+# Copy the execution script
+COPY sandbox_runner.py /sandbox_runner.py
+
+# Run as unprivileged user
+USER nobody
+WORKDIR /tmp
+
+ENTRYPOINT ["python", "/sandbox_runner.py"]
