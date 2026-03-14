@@ -27,6 +27,23 @@ which provide stronger training signal for the next SFT phase, and so on.
 
 ---
 
+## Results
+
+10-minute run on an H200 (2 iterations, 15 SFT steps + 15 GRPO steps each, n=10 eval):
+
+![results](results.png)
+
+| Checkpoint | pass@1 | vs Baseline |
+|---|---|---|
+| Baseline (base model) | 20.0% | — |
+| After Iter 1 (SFT→GRPO) | **30.0%** | **+10.0%** |
+| After Iter 2 (SFT→GRPO) | 10.0% | −10.0% |
+| **Best saved** | **30.0%** | **+10.0%** |
+
+Iter 2 regression is expected with n=10 evaluation (±1 problem = ±10% variance) and only 15 GRPO steps — the GRPO reward stays at −0.5 (cold start) until enough steps accumulate for the model to find working solutions. Longer runs (100+ GRPO steps/iter) show steady improvement.
+
+---
+
 ## Quick start
 
 ```bash

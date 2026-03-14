@@ -13,6 +13,7 @@ dependencies = [
     "wandb>=0.19.0",
     "evalplus>=0.3.1",
     "pillow>=12.1.1",
+    "matplotlib>=3.10.8",
 ]
 
 [project.optional-dependencies]
