@@ -88,6 +88,9 @@ def load_mbppplus(split: str = "train") -> Dataset:
       - Challenge tests covering edge cases
     This gives a richer reward signal for RL.
 
+    NOTE: evalplus/mbppplus only has a single "test" split (378 problems).
+    We manually split: first 300 → train, last 78 → eval.
+
     Returned columns:
         prompt        str        — problem prompt ending with ```python\n
         code          str        — reference solution (for SFT)
@@ -95,7 +98,11 @@ def load_mbppplus(split: str = "train") -> Dataset:
         test_imports  str        — import statements needed by tests
     """
     log.info(f"Loading evalplus/mbppplus [{split}]...")
-    ds = load_dataset("evalplus/mbppplus", split=split)
+    full = load_dataset("evalplus/mbppplus", split="test")
+    if split == "train":
+        ds = full.select(range(300))
+    else:
+        ds = full.select(range(300, len(full)))
     log.info(f"  {len(ds)} problems")
 
     def fmt(row):
@@ -110,7 +117,7 @@ def load_mbppplus(split: str = "train") -> Dataset:
             "prompt": prompt,
             "code": (row.get("code") or "").strip(),
             "test_list": tests,
-            "test_imports": (row.get("test_imports") or "").strip(),
+            "test_imports": "\n".join(row.get("test_imports") or []).strip(),
         }
 
     return ds.map(fmt, remove_columns=ds.column_names)
@@ -205,17 +212,18 @@ def reward_execution(
         result_map = {}
 
     rewards = []
-    for i in range(len(completions)):
+    for i, comp in enumerate(completions):
+        fmt_bonus = 0.1 if _CODE_RE.search(comp if isinstance(comp, str) else "") else 0.0
         if i not in result_map:
-            rewards.append(-0.5)  # no code extracted
+            rewards.append(-0.5 + fmt_bonus)  # no code extracted
         else:
             r = result_map[i]
             if r.total == 0:
-                rewards.append(0.0)
+                rewards.append(fmt_bonus)
             elif r.passed == 0 and r.error:
-                rewards.append(-0.5)  # crashed
+                rewards.append(-0.5 + fmt_bonus)  # crashed
             else:
-                rewards.append(r.pass_rate)
+                rewards.append(r.pass_rate + fmt_bonus)
     return rewards
 
 
@@ -392,22 +400,23 @@ def main():
             log.info(f"  [Phase 1] SFT  ({args.sft_steps} steps)")
             sft_trainer = SFTTrainer(
                 model=model,
+                processing_class=tokenizer,
                 args=SFTConfig(
                     output_dir=f"{args.output_dir}/iter{it}_sft",
                     max_steps=args.sft_steps,
-                    per_device_train_batch_size=8,
-                    gradient_accumulation_steps=2,
+                    per_device_train_batch_size=2,
+                    gradient_accumulation_steps=4,
                     learning_rate=2e-4,
                     lr_scheduler_type="cosine",
-                    warmup_steps=10,
+                    warmup_steps=5,
                     bf16=True,
                     gradient_checkpointing=True,
-                    logging_steps=20,
+                    logging_steps=5,
                     save_steps=args.sft_steps,  # save once at the end
                     report_to=report_to,
                     run_name=f"sft-qwen0.8b-iter{it}",
                     dataset_text_field="text",
-                    max_seq_length=768,
+                    max_length=512,
                     seed=args.seed,
                 ),
                 train_dataset=sft_data,
@@ -430,13 +439,13 @@ def main():
         log.info(f"  [Phase 2] GRPO ({args.rl_steps} steps)")
         grpo_trainer = GRPOTrainer(
             model=model,
+            processing_class=tokenizer,
             args=GRPOConfig(
                 output_dir=f"{args.output_dir}/iter{it}_grpo",
                 max_steps=args.rl_steps,
                 per_device_train_batch_size=4,
                 gradient_accumulation_steps=2,
                 num_generations=8,           # G: completions sampled per prompt
-                max_prompt_length=512,
                 max_completion_length=512,
                 temperature=0.9,             # enough entropy for exploration
                 learning_rate=5e-6,          # conservative — RL is noisy
@@ -453,8 +462,7 @@ def main():
                 run_name=f"grpo-qwen0.8b-iter{it}",
                 seed=args.seed,
             ),
-            reward_funcs=[reward_execution, reward_format],
-            reward_weights=[1.0, 0.1],
+            reward_funcs=[reward_execution],
             train_dataset=train_data,
         )
         grpo_trainer.train()

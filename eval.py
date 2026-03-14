@@ -96,7 +96,7 @@ def main():
                 tests_commented=tests_commented,
             ),
             "test_list": tests,
-            "test_imports": (row.get("test_imports") or "").strip(),
+            "test_imports": "\n".join(row.get("test_imports") or []).strip(),
         }
     test_data = raw.map(fmt, remove_columns=raw.column_names)
     subset = test_data.select(range(min(args.n, len(test_data))))
