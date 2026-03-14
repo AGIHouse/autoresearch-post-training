@@ -584,29 +584,20 @@ def format_reward(
 # Evaluation
 # =============================================================================
 
-def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
-                        max_tokens: int = 1024) -> list[str]:
-    """
-    Generate solutions for all prompts using vLLM batched inference.
-
-    Args:
-        model_path: Path to model or HF model ID
-        prompts: List of conversation messages (OpenAI format)
-        max_tokens: Max new tokens per completion
-
-    Returns:
-        List of generated text strings
-    """
-    import gc
+def _generate_batch_vllm_worker(model_path: str, prompts_json: str,
+                                 max_tokens: int) -> str:
+    """Worker function that runs in a subprocess to generate with vLLM.
+    Subprocess ensures GPU memory is fully released on exit."""
+    import json
     import os
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
-    # vLLM needs absolute paths for local models
+    prompts = json.loads(prompts_json)
+
     if os.path.exists(model_path):
         model_path = os.path.abspath(model_path)
 
-    logger.info(f"Loading model into vLLM: {model_path}")
     llm = LLM(
         model=model_path,
         dtype="bfloat16",
@@ -617,34 +608,51 @@ def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    # Format prompts using chat template
     formatted = []
     for messages in prompts:
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         formatted.append(text)
 
-    sampling_params = SamplingParams(
-        temperature=0,  # greedy for deterministic eval
-        max_tokens=max_tokens,
-    )
-
-    logger.info(f"Generating {len(formatted)} completions with vLLM...")
+    sampling_params = SamplingParams(temperature=0, max_tokens=max_tokens)
     outputs = llm.generate(formatted, sampling_params)
 
-    # Extract generated text, sorted by request order
     results = [""] * len(formatted)
     for output in outputs:
         idx = output.request_id
         results[int(idx)] = output.outputs[0].text
 
-    # Free GPU memory — must shut down vLLM engine to release CUDA contexts
-    from vllm.distributed.parallel_state import destroy_model_parallel
-    destroy_model_parallel()
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    return json.dumps(results)
 
+
+def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
+                        max_tokens: int = 1024) -> list[str]:
+    """
+    Generate solutions for all prompts using vLLM batched inference.
+    Runs in a subprocess to ensure GPU memory is fully released afterward.
+
+    Args:
+        model_path: Path to model or HF model ID
+        prompts: List of conversation messages (OpenAI format)
+        max_tokens: Max new tokens per completion
+
+    Returns:
+        List of generated text strings
+    """
+    import json
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    if os.path.exists(model_path):
+        model_path = os.path.abspath(model_path)
+
+    logger.info(f"Loading model into vLLM (subprocess): {model_path}")
+    prompts_json = json.dumps(prompts)
+
+    with ProcessPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_generate_batch_vllm_worker, model_path, prompts_json, max_tokens)
+        results_json = future.result()
+
+    results = json.loads(results_json)
     logger.info("Generation complete")
     return results
 
