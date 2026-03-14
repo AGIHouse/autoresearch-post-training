@@ -611,7 +611,7 @@ def generate_batch_vllm(model_path: str, prompts: list[list[dict]],
         model=model_path,
         dtype="bfloat16",
         max_model_len=4096,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.5,
         trust_remote_code=True,
     )
 
