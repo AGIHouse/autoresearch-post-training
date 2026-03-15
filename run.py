@@ -200,12 +200,12 @@ def propose_change(client, train_py, results_history, prev_log=None):
 
 def run_experiment():
     """Push code, run training on remote GPU, return output."""
-    # Push to remote
+    # Push to remote (set upstream on first push)
     print("  Pushing to remote...")
-    out, rc = run("git push", timeout=30)
+    out, rc = run("git push -u origin HEAD", timeout=30)
     if rc != 0:
         # Try force push if needed (we may have reset)
-        out, rc = run("git push --force-with-lease", timeout=30)
+        out, rc = run("git push --force-with-lease -u origin HEAD", timeout=30)
         if rc != 0:
             return f"PUSH FAILED:\n{out}", rc
 
