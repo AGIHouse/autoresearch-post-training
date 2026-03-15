@@ -38,7 +38,7 @@ vllm_mode: "colocate"
 vllm_gpu_memory_utilization: 0.45
 
 # Time budget (DO NOT CHANGE — controls experiment duration)
-time_budget_seconds: 180
+time_budget_seconds: 300
 
 # Training
 bf16: true
