@@ -90,7 +90,7 @@ class TrainingConfig:
     vllm_sleep_enabled: bool = False
 
     # Time budget
-    time_budget_seconds: int = 300  # 5 minute wall-clock hard limit
+    time_budget_seconds: int = 60  # 1 minute wall-clock hard limit
 
     # Training
     bf16: bool = True
