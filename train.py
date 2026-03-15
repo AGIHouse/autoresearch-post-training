@@ -1,7 +1,8 @@
 """
 autoresearch: continuously train Qwen3.5-0.8B-Base on MBPP++ coding problems.
 
-The training loop runs for N iterations. Each iteration has two phases:
+The training loop runs for N iterations (or until a wall-clock budget is hit).
+Each iteration has two phases:
 
     Phase 1 — SFT (Supervised Fine-Tuning)
         Train on MBPP++ reference solutions with teacher forcing.
@@ -23,29 +24,33 @@ The training loop runs for N iterations. Each iteration has two phases:
         Why LoRA?           Only ~50M trainable params out of 800M → fast
                             updates, small optimizer state, easy to reset.
 
-    After each iteration we run a quick pass@1 eval on the MBPP++ test set
-    and save the best checkpoint.
+    After each iteration we evaluate pass@1 on the MBPP++ test set, log the
+    result to a JSONL file, and save the best checkpoint.
 
 Usage:
-    python train.py                           # defaults: 3 iterations
-    python train.py --iterations 5 --sft_steps 300 --rl_steps 300
+    python train.py                                   # defaults
+    python train.py --sft_budget 30 --grpo_budget 90 --iterations 12
+    python train.py --total_budget 1200               # stop after 20 min total
     python train.py --output_dir runs/exp1 --no_wandb
-    python train.py --rl_only                 # skip SFT (if already fine-tuned)
+    python train.py --rl_only                         # skip SFT phase
 
-Dataset:  evalplus/mbppplus  (MBPP with more test cases; 374 train, 500 test)
+Dataset:  evalplus/mbppplus  (378 problems; first 300 train, last 78 eval)
 Model:    Qwen/Qwen3.5-0.8B-Base
 Hardware: fits in ~6 GB VRAM (bf16 + LoRA)
 """
 
 import argparse
+import json
 import logging
 import os
 import re
+import time
+from datetime import datetime
 
 import torch
 from datasets import Dataset, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from trl import GRPOConfig, GRPOTrainer, SFTConfig, SFTTrainer
 
 from sandbox import ExecResult, run_batch, run_code
@@ -61,8 +66,6 @@ log = logging.getLogger(__name__)
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B-Base"
 
-# The prompt primes the model to write a ```python block.
-# For a base model we use completion-style formatting (no chat template).
 PROMPT_TEMPLATE = """\
 # Python programming task
 # {description}
@@ -73,8 +76,28 @@ PROMPT_TEMPLATE = """\
 ```python
 """
 
-# Matches a ```python ... ``` block (used in extraction)
 _CODE_RE = re.compile(r"```python\s*\n(.*?)(?:```|$)", re.DOTALL)
+
+
+# ── Time-budget callback ────────────────────────────────────────────────────────
+
+class TimeBudgetCallback(TrainerCallback):
+    """Stop training when a wall-clock budget (seconds) is exhausted."""
+
+    def __init__(self, budget_seconds: float):
+        self.budget = budget_seconds
+        self.start_time: float | None = None
+        self.steps_run = 0
+
+    def on_train_begin(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        self.start_time = time.time()
+        return control
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        self.steps_run += 1
+        if self.budget > 0 and time.time() - self.start_time >= self.budget:
+            control.should_training_stop = True
+        return control
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
@@ -83,19 +106,8 @@ def load_mbppplus(split: str = "train") -> Dataset:
     """
     Load MBPP++ and format for training.
 
-    MBPP++ (evalplus/mbppplus) extends the original MBPP with:
-      - More test cases per problem (avg ~7 vs MBPP's 3)
-      - Challenge tests covering edge cases
-    This gives a richer reward signal for RL.
-
-    NOTE: evalplus/mbppplus only has a single "test" split (378 problems).
+    evalplus/mbppplus only has a single "test" split (378 problems).
     We manually split: first 300 → train, last 78 → eval.
-
-    Returned columns:
-        prompt        str        — problem prompt ending with ```python\n
-        code          str        — reference solution (for SFT)
-        test_list     list[str]  — assert strings (for RL reward)
-        test_imports  str        — import statements needed by tests
     """
     log.info(f"Loading evalplus/mbppplus [{split}]...")
     full = load_dataset("evalplus/mbppplus", split="test")
@@ -107,7 +119,6 @@ def load_mbppplus(split: str = "train") -> Dataset:
 
     def fmt(row):
         tests = row.get("test_list") or []
-        # Show first 3 tests in the prompt so the model knows function signatures
         tests_commented = "\n".join(f"# {t}" for t in tests[:3])
         prompt = PROMPT_TEMPLATE.format(
             description=row["prompt"].strip(),
@@ -124,32 +135,15 @@ def load_mbppplus(split: str = "train") -> Dataset:
 
 
 def make_sft_dataset(data: Dataset) -> Dataset:
-    """
-    Convert MBPP++ rows into full text sequences for SFT.
-
-    Each sequence is:
-        [prompt ending with ```python\n] + [reference code] + [\n```\n]
-
-    SFT trains the model to predict this entire sequence (standard causal LM).
-    The model learns both the output format (python fences) and correct solutions.
-    """
     def to_text(row):
         return {"text": row["prompt"] + row["code"] + "\n```\n"}
-
     return data.map(to_text, remove_columns=data.column_names)
 
 
 # ── Code extraction ────────────────────────────────────────────────────────────
 
 def extract_code(text: str | list) -> str | None:
-    """
-    Pull Python code out of a completion.
-
-    Handles both string completions and TRL's chat-dict format.
-    Returns None if no code block found.
-    """
     if isinstance(text, list):
-        # TRL sometimes wraps completions as message dicts
         for msg in reversed(text):
             if isinstance(msg, dict) and msg.get("role") == "assistant":
                 text = msg.get("content", "")
@@ -161,16 +155,11 @@ def extract_code(text: str | list) -> str | None:
     if m:
         return m.group(1).strip() or None
 
-    # Fallback: if prompt primed with ```python\n, the completion IS the code
-    # (model may not include closing ```)
     stripped = text.strip()
     return stripped if stripped else None
 
 
-# ── Reward functions ────────────────────────────────────────────────────────────
-# TRL's GRPOTrainer calls these with signature:
-#   fn(prompts, completions, **extra_columns) -> list[float]
-# Extra dataset columns (test_list, test_imports) are passed as kwargs.
+# ── Reward function ────────────────────────────────────────────────────────────
 
 def reward_execution(
     prompts: list,
@@ -180,22 +169,15 @@ def reward_execution(
     **kwargs,
 ) -> list[float]:
     """
-    Execute each completion's code against the problem's test cases.
-
-    Reward scale (partial credit mode):
-        -0.5   code can't be parsed, or crashes before running any test
+    Reward scale:
+        -0.5   syntax error or runtime crash        (+ 0.1 format bonus if ```python present)
          0.0   runs but passes 0 tests
-         0–1   passes / total (partial credit — useful when problems have few tests)
+         0–1   passed / total  (partial credit)
          1.0   all tests pass
-
-    Why partial credit?  MBPP++ has ~7 tests/problem. Giving 3/7 vs 0/7 credit
-    provides a denser gradient signal than binary pass/fail, which helps the
-    0.8B model bootstrap from near-zero performance.
     """
     if test_list is None:
         return [0.0] * len(completions)
 
-    # Build (code, tests, setup_imports) for each completion
     exec_items: list[tuple[str, list[str], str] | None] = []
     for i, comp in enumerate(completions):
         code = extract_code(comp)
@@ -203,7 +185,6 @@ def reward_execution(
         imports = test_imports[i] if test_imports and i < len(test_imports) else ""
         exec_items.append((code, tests, imports) if code else None)
 
-    # Execute non-None items in parallel; preserve order
     valid_items = [(it, i) for i, it in enumerate(exec_items) if it is not None]
     if valid_items:
         results: list[ExecResult] = run_batch([it for it, _ in valid_items])
@@ -215,47 +196,23 @@ def reward_execution(
     for i, comp in enumerate(completions):
         fmt_bonus = 0.1 if _CODE_RE.search(comp if isinstance(comp, str) else "") else 0.0
         if i not in result_map:
-            rewards.append(-0.5 + fmt_bonus)  # no code extracted
+            rewards.append(-0.5 + fmt_bonus)
         else:
             r = result_map[i]
             if r.total == 0:
                 rewards.append(fmt_bonus)
             elif r.passed == 0 and r.error:
-                rewards.append(-0.5 + fmt_bonus)  # crashed
+                rewards.append(-0.5 + fmt_bonus)
             else:
                 rewards.append(r.pass_rate + fmt_bonus)
     return rewards
 
 
-def reward_format(prompts: list, completions: list, **kwargs) -> list[float]:
-    """
-    Small bonus (+0.1 weight) for wrapping code in a ```python block.
-
-    This nudges the model toward structured output without overpowering the
-    correctness signal. In practice it mainly matters in the first few steps
-    before the model learns the format from SFT.
-    """
-    return [1.0 if _CODE_RE.search(c if isinstance(c, str) else "") else 0.0
-            for c in completions]
-
-
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(
-    model,
-    tokenizer,
-    test_data: Dataset,
-    n: int = 100,
-    max_new_tokens: int = 512,
-    exec_timeout: float = 10.0,
-) -> float:
-    """
-    Estimate pass@1 on the MBPP++ test set using greedy decoding.
-
-    We generate one solution per problem (greedy, deterministic) and check
-    if it passes all test cases. Returns fraction of problems solved.
-    """
+def evaluate(model, tokenizer, test_data: Dataset, n: int = 50) -> float:
+    """Estimate pass@1 on MBPP++ test set using greedy decoding."""
     model.eval()
     device = next(model.parameters()).device
     subset = test_data.select(range(min(n, len(test_data))))
@@ -271,27 +228,31 @@ def evaluate(
 
         out = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=512,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
         new_tok = out[0][inputs["input_ids"].shape[-1]:]
         completion = tokenizer.decode(new_tok, skip_special_tokens=True)
 
-        # The prompt ends with ```python\n so prepend it to help extraction
         code = extract_code(row["prompt"] + completion)
         if code:
-            result = run_code(
-                code,
-                row["test_list"],
-                row["test_imports"],
-                timeout=exec_timeout,
-            )
+            result = run_code(code, row["test_list"], row["test_imports"], timeout=10.0)
             if result.all_passed:
                 passed += 1
 
     model.train()
     return passed / len(subset)
+
+
+# ── JSONL experiment logger ────────────────────────────────────────────────────
+
+def log_experiment(log_file: str, entry: dict):
+    """Append one experiment result to the JSONL log."""
+    os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+    with open(log_file, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    log.info(f"  Logged → {log_file}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -301,26 +262,37 @@ def main():
         description="autoresearch: continuously train Qwen3.5-0.8B on MBPP++",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--iterations",  type=int,   default=3,
-                        help="number of SFT→GRPO cycles")
-    parser.add_argument("--sft_steps",   type=int,   default=200,
-                        help="gradient steps per SFT phase")
-    parser.add_argument("--rl_steps",    type=int,   default=200,
-                        help="gradient steps per GRPO phase")
-    parser.add_argument("--eval_n",      type=int,   default=100,
+    parser.add_argument("--iterations",    type=int,   default=20,
+                        help="max SFT→GRPO cycles (may be cut short by --total_budget)")
+    parser.add_argument("--sft_budget",    type=float, default=30.0,
+                        help="wall-clock seconds per SFT phase (0 = use --sft_steps)")
+    parser.add_argument("--sft_steps",     type=int,   default=200,
+                        help="gradient steps per SFT phase (used when sft_budget=0)")
+    parser.add_argument("--sft_lr",        type=float, default=5e-5,
+                        help="SFT learning rate (lower = less catastrophic forgetting)")
+    parser.add_argument("--grpo_budget",   type=float, default=300.0,
+                        help="wall-clock seconds per GRPO phase (0 = use --rl_steps)")
+    parser.add_argument("--grpo_lr",       type=float, default=5e-6,
+                        help="GRPO learning rate")
+    parser.add_argument("--rl_steps",      type=int,   default=200,
+                        help="gradient steps per GRPO phase (used when grpo_budget=0)")
+    parser.add_argument("--total_budget",  type=float, default=0.0,
+                        help="total wall-clock seconds for the whole run (0 = no limit)")
+    parser.add_argument("--eval_n",        type=int,   default=30,
                         help="problems to evaluate after each iteration")
-    parser.add_argument("--output_dir",  type=str,   default="./outputs")
-    parser.add_argument("--no_wandb",    action="store_true",
-                        help="disable Weights & Biases logging")
-    parser.add_argument("--rl_only",     action="store_true",
-                        help="skip SFT phase (use when resuming from a checkpoint)")
-    parser.add_argument("--lora_r",      type=int,   default=16,
-                        help="LoRA rank — higher = more capacity, more memory")
-    parser.add_argument("--seed",        type=int,   default=42)
+    parser.add_argument("--output_dir",    type=str,   default="./outputs")
+    parser.add_argument("--log_file",      type=str,   default="./experiment_log.jsonl",
+                        help="path to append per-iteration JSONL results")
+    parser.add_argument("--no_wandb",      action="store_true")
+    parser.add_argument("--rl_only",       action="store_true",
+                        help="skip SFT phase")
+    parser.add_argument("--lora_r",        type=int,   default=16)
+    parser.add_argument("--seed",          type=int,   default=42)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     report_to = "none" if args.no_wandb else "wandb"
+    run_start = time.time()
 
     torch.manual_seed(args.seed)
 
@@ -329,9 +301,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # required for decoder-only generation
+    tokenizer.padding_side = "left"
 
-    # Try flash attention; silently fall back if not available
     attn_impl = "flash_attention_2"
     try:
         import flash_attn  # noqa: F401
@@ -347,17 +318,12 @@ def main():
         attn_implementation=attn_impl,
     )
 
-    # Apply LoRA ONCE before the loop.
-    # Both SFT and GRPO will update the same adapter weights each iteration —
-    # no need to re-apply LoRA, and it avoids stacking adapters by accident.
     lora = LoraConfig(
         r=args.lora_r,
-        lora_alpha=args.lora_r * 2,   # standard heuristic: alpha = 2 * r
+        lora_alpha=args.lora_r * 2,
         lora_dropout=0.05,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
         task_type=TaskType.CAUSAL_LM,
         bias="none",
     )
@@ -367,52 +333,64 @@ def main():
     # ── Load data ─────────────────────────────────────────────────────────────
     train_data = load_mbppplus("train")
     test_data  = load_mbppplus("test")
-    sft_data   = make_sft_dataset(train_data)  # full text for teacher-forcing
-    # train_data already has prompt/test_list/test_imports for GRPO
-
+    sft_data   = make_sft_dataset(train_data)
     log.info(f"Train: {len(train_data)} problems  |  Test: {len(test_data)} problems")
 
     # ── Baseline evaluation ───────────────────────────────────────────────────
-    log.info("Running baseline eval (greedy, pass@1)...")
+    log.info("Running baseline eval...")
+    t0 = time.time()
     baseline = evaluate(model, tokenizer, test_data, n=args.eval_n)
-    log.info(f"  Baseline pass@1 = {baseline:.1%}")
+    log.info(f"  Baseline pass@1 = {baseline:.1%}  ({time.time()-t0:.0f}s)")
     best_score = baseline
 
-    # ── Continuous training loop ───────────────────────────────────────────────
-    #
-    # The loop runs `--iterations` times. Each iteration:
-    #   1. SFT   — teaches format + good starting policy
-    #   2. GRPO  — explores via sampling, rewards correct solutions
-    #   3. Eval  — measure progress, save best checkpoint
-    #
-    # Starting from iteration 2, the model already knows the format well from
-    # the previous SFT phase, so GRPO gets a head start. The cycle continues
-    # to improve the policy as long as GRPO finds new solutions to learn from.
+    # Log baseline as iteration 0
+    log_experiment(args.log_file, {
+        "iteration": 0,
+        "pass_at_1": round(baseline * 100, 1),
+        "baseline": round(baseline * 100, 1),
+        "delta": 0.0,
+        "is_best": True,
+        "description": "baseline (no fine-tuning)",
+        "sft_steps_run": 0,
+        "grpo_steps_run": 0,
+        "elapsed_s": round(time.time() - run_start, 1),
+        "timestamp": datetime.now().isoformat(),
+    })
 
+    # ── Training loop ─────────────────────────────────────────────────────────
     for it in range(1, args.iterations + 1):
+
+        # Check total budget
+        if args.total_budget > 0 and (time.time() - run_start) >= args.total_budget:
+            log.info(f"Total budget ({args.total_budget}s) reached — stopping after {it-1} iterations.")
+            break
+
         log.info("")
         log.info(f"{'='*60}")
-        log.info(f"  ITERATION {it} / {args.iterations}")
+        log.info(f"  ITERATION {it} / {args.iterations}  (elapsed {time.time()-run_start:.0f}s)")
         log.info(f"{'='*60}")
 
         # ── Phase 1: SFT ──────────────────────────────────────────────────────
+        sft_cb = TimeBudgetCallback(args.sft_budget)
         if not args.rl_only:
-            log.info(f"  [Phase 1] SFT  ({args.sft_steps} steps)")
+            max_sft = args.sft_steps if args.sft_budget == 0 else 99999
+            sft_label = f"{args.sft_budget}s" if args.sft_budget > 0 else f"{args.sft_steps} steps"
+            log.info(f"  [Phase 1] SFT  ({sft_label})")
             sft_trainer = SFTTrainer(
                 model=model,
                 processing_class=tokenizer,
                 args=SFTConfig(
                     output_dir=f"{args.output_dir}/iter{it}_sft",
-                    max_steps=args.sft_steps,
+                    max_steps=max_sft,
                     per_device_train_batch_size=2,
                     gradient_accumulation_steps=4,
-                    learning_rate=2e-4,
+                    learning_rate=args.sft_lr,
                     lr_scheduler_type="cosine",
-                    warmup_steps=5,
+                    warmup_steps=3,
                     bf16=True,
                     gradient_checkpointing=True,
-                    logging_steps=5,
-                    save_steps=args.sft_steps,  # save once at the end
+                    logging_steps=999999,   # suppress per-step output
+                    save_steps=99999,
                     report_to=report_to,
                     run_name=f"sft-qwen0.8b-iter{it}",
                     dataset_text_field="text",
@@ -420,83 +398,97 @@ def main():
                     seed=args.seed,
                 ),
                 train_dataset=sft_data,
+                callbacks=[sft_cb],
             )
             sft_trainer.train()
+            log.info(f"    SFT ran {sft_cb.steps_run} steps")
             del sft_trainer
             torch.cuda.empty_cache()
 
         # ── Phase 2: GRPO ─────────────────────────────────────────────────────
-        #
-        # For each training step GRPO:
-        #   1. Samples num_generations=8 completions per prompt
-        #   2. Scores each with reward_execution + reward_format
-        #   3. Computes group-relative advantages within each prompt's 8 completions
-        #   4. Updates LoRA params to push toward high-advantage completions
-        #
-        # With per_device_train_batch_size=4 and grad_accum=2:
-        #   8 prompts/step × 8 completions = 64 code executions/step
-        #   At ~0.3s/execution (parallel): ~3s overhead/step
-        log.info(f"  [Phase 2] GRPO ({args.rl_steps} steps)")
+        grpo_cb = TimeBudgetCallback(args.grpo_budget)
+        max_grpo = args.rl_steps if args.grpo_budget == 0 else 99999
+        grpo_label = f"{args.grpo_budget}s" if args.grpo_budget > 0 else f"{args.rl_steps} steps"
+        log.info(f"  [Phase 2] GRPO ({grpo_label})")
         grpo_trainer = GRPOTrainer(
             model=model,
             processing_class=tokenizer,
             args=GRPOConfig(
                 output_dir=f"{args.output_dir}/iter{it}_grpo",
-                max_steps=args.rl_steps,
+                max_steps=max_grpo,
                 per_device_train_batch_size=4,
                 gradient_accumulation_steps=2,
-                num_generations=8,           # G: completions sampled per prompt
+                num_generations=8,
                 max_completion_length=512,
-                temperature=0.9,             # enough entropy for exploration
-                learning_rate=5e-6,          # conservative — RL is noisy
+                temperature=0.9,
+                learning_rate=args.grpo_lr,
                 lr_scheduler_type="constant_with_warmup",
-                warmup_steps=5,
-                beta=0.0,                    # no KL penalty (beta=0 is current best practice)
-                loss_type="grpo",            # standard GRPO (group relative advantage)
-                scale_rewards=True,          # normalize reward std within each group
+                warmup_steps=3,
+                beta=0.0,
+                loss_type="grpo",
+                scale_rewards=True,
                 bf16=True,
                 gradient_checkpointing=True,
-                logging_steps=1,
-                save_steps=args.rl_steps,
+                logging_steps=999999,   # suppress per-step output
+                save_steps=99999,
                 report_to=report_to,
                 run_name=f"grpo-qwen0.8b-iter{it}",
                 seed=args.seed,
             ),
             reward_funcs=[reward_execution],
             train_dataset=train_data,
+            callbacks=[grpo_cb],
         )
         grpo_trainer.train()
+        log.info(f"    GRPO ran {grpo_cb.steps_run} steps")
         del grpo_trainer
         torch.cuda.empty_cache()
 
         # ── Evaluate ──────────────────────────────────────────────────────────
-        log.info(f"  Evaluating (greedy, pass@1, n={args.eval_n})...")
+        log.info(f"  Evaluating (pass@1, n={args.eval_n})...")
+        t0 = time.time()
         score = evaluate(model, tokenizer, test_data, n=args.eval_n)
         delta = score - baseline
+        is_best = score > best_score
+        sign = "↑" if delta >= 0 else "↓"
+        star = "  ★ NEW BEST" if is_best else ""
         log.info(
             f"  Iteration {it}  pass@1 = {score:.1%}  "
-            f"({'↑' if delta >= 0 else '↓'}{abs(delta):.1%} vs baseline)"
+            f"({sign}{abs(delta):.1%} vs baseline){star}  ({time.time()-t0:.0f}s)"
         )
 
-        # Save every iteration checkpoint
-        ckpt = f"{args.output_dir}/iter{it}"
-        model.save_pretrained(ckpt)
-        tokenizer.save_pretrained(ckpt)
-        log.info(f"  Saved → {ckpt}")
-
-        if score > best_score:
+        if is_best:
             best_score = score
             model.save_pretrained(f"{args.output_dir}/best")
             tokenizer.save_pretrained(f"{args.output_dir}/best")
-            log.info(f"  ★ New best!  Saved → {args.output_dir}/best")
+            log.info(f"  Saved best → {args.output_dir}/best")
+
+        # ── Log to JSONL ──────────────────────────────────────────────────────
+        description = (
+            f"SFT {sft_cb.steps_run}steps(lr={args.sft_lr:.0e}) "
+            f"+ GRPO {grpo_cb.steps_run}steps(lr={args.grpo_lr:.0e}, G=8)"
+        )
+        log_experiment(args.log_file, {
+            "iteration": it,
+            "pass_at_1": round(score * 100, 1),
+            "baseline": round(baseline * 100, 1),
+            "delta": round(delta * 100, 1),
+            "is_best": is_best,
+            "description": description,
+            "sft_steps_run": sft_cb.steps_run,
+            "grpo_steps_run": grpo_cb.steps_run,
+            "elapsed_s": round(time.time() - run_start, 1),
+            "timestamp": datetime.now().isoformat(),
+        })
 
     # ── Done ─────────────────────────────────────────────────────────────────
+    total_elapsed = time.time() - run_start
     log.info("")
-    log.info(f"Training complete.")
+    log.info(f"Training complete in {total_elapsed/60:.1f} min.")
     log.info(f"  Baseline  pass@1 = {baseline:.1%}")
-    log.info(f"  Final     pass@1 = {score:.1%}")
-    log.info(f"  Best      pass@1 = {best_score:.1%}")
+    log.info(f"  Best      pass@1 = {best_score:.1%}  (+{(best_score-baseline):.1%})")
     log.info(f"  Best checkpoint → {args.output_dir}/best")
+    log.info(f"  Experiment log  → {args.log_file}")
 
 
 if __name__ == "__main__":
