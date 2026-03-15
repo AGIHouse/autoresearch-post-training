@@ -603,6 +603,7 @@ def _generate_batch_vllm_worker(model_path: str, prompts_json: str,
         dtype="bfloat16",
         max_model_len=4096,
         gpu_memory_utilization=0.5,
+        max_num_seqs=64,
         trust_remote_code=True,
     )
 
