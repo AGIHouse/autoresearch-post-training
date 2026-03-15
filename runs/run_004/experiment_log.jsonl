@@ -1,0 +1,1 @@
+{"iteration": 0, "pass_at_1": 56.7, "baseline": 56.7, "delta": 0.0, "is_best": true, "description": "baseline (no fine-tuning)", "sft_steps_run": 0, "grpo_steps_run": 0, "elapsed_s": 54.8, "timestamp": "2026-03-15T01:59:10.095563"}

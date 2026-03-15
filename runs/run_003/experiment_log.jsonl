@@ -1,0 +1,3 @@
+{"iteration": 0, "pass_at_1": 30.0, "baseline": 30.0, "delta": 0.0, "is_best": true, "description": "baseline (no fine-tuning)", "sft_steps_run": 0, "grpo_steps_run": 0, "elapsed_s": 150.5, "timestamp": "2026-03-15T01:23:34.895611"}
+{"iteration": 1, "pass_at_1": 26.7, "baseline": 30.0, "delta": -3.3, "is_best": false, "description": "SFT 0steps(lr=5e-05) + GRPO 41steps(lr=5e-06, G=8)", "sft_steps_run": 0, "grpo_steps_run": 41, "elapsed_s": 960.4, "timestamp": "2026-03-15T01:37:04.725497"}
+{"iteration": 2, "pass_at_1": 20.0, "baseline": 30.0, "delta": -10.0, "is_best": false, "description": "SFT 0steps(lr=5e-05) + GRPO 36steps(lr=5e-06, G=8)", "sft_steps_run": 0, "grpo_steps_run": 36, "elapsed_s": 1833.4, "timestamp": "2026-03-15T01:51:37.791745"}

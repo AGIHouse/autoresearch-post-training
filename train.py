@@ -64,9 +64,10 @@ log = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-MODEL_ID = "Qwen/Qwen3.5-0.8B-Base"
+DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 
-PROMPT_TEMPLATE = """\
+# Base-model prompt: completion-style, primed with ```python
+BASE_PROMPT_TEMPLATE = """\
 # Python programming task
 # {description}
 #
@@ -77,6 +78,31 @@ PROMPT_TEMPLATE = """\
 """
 
 _CODE_RE = re.compile(r"```python\s*\n(.*?)(?:```|$)", re.DOTALL)
+
+
+def build_prompt(row: dict, tokenizer) -> str:
+    """
+    Build a prompt for the given dataset row.
+    - Instruct models (has chat_template): use apply_chat_template with a user message.
+    - Base models: use the completion-style BASE_PROMPT_TEMPLATE.
+    """
+    tests = row.get("test_list") or []
+    tests_str = "\n".join(tests[:3])
+    description = row["prompt"].strip() if isinstance(row["prompt"], str) else row["prompt"]
+
+    if getattr(tokenizer, "chat_template", None):
+        messages = [{"role": "user", "content":
+            f"Write a Python function to solve this task:\n{description}\n\n"
+            f"The function must pass these tests:\n{tests_str}\n\n"
+            f"Respond with only a ```python code block."}]
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        tests_commented = "\n".join(f"# {t}" for t in tests[:3])
+        return BASE_PROMPT_TEMPLATE.format(
+            description=description, tests_commented=tests_commented
+        )
 
 
 # ── Time-budget callback ────────────────────────────────────────────────────────
@@ -102,12 +128,15 @@ class TimeBudgetCallback(TrainerCallback):
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 
-def load_mbppplus(split: str = "train") -> Dataset:
+def load_mbppplus(split: str, tokenizer) -> Dataset:
     """
     Load MBPP++ and format for training.
 
     evalplus/mbppplus only has a single "test" split (378 problems).
     We manually split: first 300 → train, last 78 → eval.
+
+    Keeps 'description' and 'tests_str' as raw text so make_sft_dataset
+    can build the full instruct conversation without re-parsing.
     """
     log.info(f"Loading evalplus/mbppplus [{split}]...")
     full = load_dataset("evalplus/mbppplus", split="test")
@@ -119,24 +148,36 @@ def load_mbppplus(split: str = "train") -> Dataset:
 
     def fmt(row):
         tests = row.get("test_list") or []
-        tests_commented = "\n".join(f"# {t}" for t in tests[:3])
-        prompt = PROMPT_TEMPLATE.format(
-            description=row["prompt"].strip(),
-            tests_commented=tests_commented,
-        )
+        description = row["prompt"].strip()
         return {
-            "prompt": prompt,
+            "prompt": build_prompt(row, tokenizer),
+            "description": description,
             "code": (row.get("code") or "").strip(),
             "test_list": tests,
+            "tests_str": "\n".join(tests[:3]),
             "test_imports": "\n".join(row.get("test_imports") or []).strip(),
         }
 
     return ds.map(fmt, remove_columns=ds.column_names)
 
 
-def make_sft_dataset(data: Dataset) -> Dataset:
+def make_sft_dataset(data: Dataset, tokenizer) -> Dataset:
+    """Build full supervised sequences for SFT.
+    Instruct models: user task message + assistant ```python code``` response.
+    Base models: raw completion-style text.
+    """
     def to_text(row):
-        return {"text": row["prompt"] + row["code"] + "\n```\n"}
+        if getattr(tokenizer, "chat_template", None):
+            messages = [
+                {"role": "user", "content":
+                    f"Write a Python function to solve this task:\n{row['description']}\n\n"
+                    f"The function must pass these tests:\n{row['tests_str']}\n\n"
+                    f"Respond with only a ```python code block."},
+                {"role": "assistant", "content": f"```python\n{row['code']}\n```"},
+            ]
+            return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
+        else:
+            return {"text": row["prompt"] + row["code"] + "\n```\n"}
     return data.map(to_text, remove_columns=data.column_names)
 
 
@@ -223,7 +264,7 @@ def evaluate(model, tokenizer, test_data: Dataset, n: int = 50) -> float:
             row["prompt"],
             return_tensors="pt",
             truncation=True,
-            max_length=512,
+            max_length=768,
         ).to(device)
 
         out = model.generate(
@@ -235,7 +276,10 @@ def evaluate(model, tokenizer, test_data: Dataset, n: int = 50) -> float:
         new_tok = out[0][inputs["input_ids"].shape[-1]:]
         completion = tokenizer.decode(new_tok, skip_special_tokens=True)
 
-        code = extract_code(row["prompt"] + completion)
+        # For instruct models the completion contains the full response incl. ```python
+        # For base models prepend the prompt to help extraction
+        search_text = completion if getattr(tokenizer, "chat_template", None) else row["prompt"] + completion
+        code = extract_code(search_text)
         if code:
             result = run_code(code, row["test_list"], row["test_imports"], timeout=10.0)
             if result.all_passed:
@@ -286,6 +330,8 @@ def main():
     parser.add_argument("--no_wandb",      action="store_true")
     parser.add_argument("--rl_only",       action="store_true",
                         help="skip SFT phase")
+    parser.add_argument("--model_id",      type=str,   default=DEFAULT_MODEL_ID,
+                        help="HuggingFace model ID")
     parser.add_argument("--lora_r",        type=int,   default=16)
     parser.add_argument("--seed",          type=int,   default=42)
     args = parser.parse_args()
@@ -297,8 +343,8 @@ def main():
     torch.manual_seed(args.seed)
 
     # ── Load model & tokenizer ────────────────────────────────────────────────
-    log.info(f"Loading {MODEL_ID}...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    log.info(f"Loading {args.model_id}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -311,7 +357,7 @@ def main():
         log.info("flash_attn not found, using eager attention")
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
+        args.model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
@@ -331,9 +377,9 @@ def main():
     model.print_trainable_parameters()
 
     # ── Load data ─────────────────────────────────────────────────────────────
-    train_data = load_mbppplus("train")
-    test_data  = load_mbppplus("test")
-    sft_data   = make_sft_dataset(train_data)
+    train_data = load_mbppplus("train", tokenizer)
+    test_data  = load_mbppplus("test",  tokenizer)
+    sft_data   = make_sft_dataset(train_data, tokenizer)
     log.info(f"Train: {len(train_data)} problems  |  Test: {len(test_data)} problems")
 
     # ── Baseline evaluation ───────────────────────────────────────────────────
@@ -464,9 +510,10 @@ def main():
             log.info(f"  Saved best → {args.output_dir}/best")
 
         # ── Log to JSONL ──────────────────────────────────────────────────────
+        model_short = args.model_id.split("/")[-1]
         description = (
-            f"SFT {sft_cb.steps_run}steps(lr={args.sft_lr:.0e}) "
-            f"+ GRPO {grpo_cb.steps_run}steps(lr={args.grpo_lr:.0e}, G=8)"
+            f"{model_short}: SFT {sft_cb.steps_run}s(lr={args.sft_lr:.0e}) "
+            f"+ GRPO {grpo_cb.steps_run}s(lr={args.grpo_lr:.0e}, G=8)"
         )
         log_experiment(args.log_file, {
             "iteration": it,
