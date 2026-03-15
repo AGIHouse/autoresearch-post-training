@@ -5,6 +5,7 @@ description = "Autonomous post-training research (GRPO, SFT, DPO) for coding age
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "anthropic>=0.52.0",
     "trl>=0.23.0",
     "transformers>=4.48.0",
     "accelerate>=1.3.0",

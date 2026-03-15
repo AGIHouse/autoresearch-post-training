@@ -77,7 +77,7 @@ class TrainingConfig:
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
     num_train_epochs: int = 3
-    max_steps: int = 200
+    max_steps: int = 1000
     beta: float = 0.0
     loss_type: str = "grpo"
     scale_rewards: bool = True

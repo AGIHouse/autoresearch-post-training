@@ -1,67 +1,51 @@
 # autoresearch-post-training
 
-This is an experiment to have an LLM autonomously research post-training techniques for coding agents using GRPO on MBPP++ (EvalPlus).
+Autonomous self-improvement loop for GRPO post-training on MBPP++.
 
-## Setup
+## Architecture
 
-To set up a new experiment, work with the user to:
+- **`run.py`** — Orchestration loop. Calls Claude (Opus) to propose changes, runs experiments on remote GPU, keeps only improvements. Runs indefinitely.
+- **`train.py`** — The ONLY file the LLM modifies. Contains TrainingConfig, LoRA/GRPO setup, callbacks, and training loop.
+- **`prepare.py`** — Fixed infrastructure (READ-ONLY). Sandbox, MBPP++ dataset, reward functions, evaluation.
+- **`configs/default.yaml`** — Default hyperparameters.
+- **`results.tsv`** — Experiment log (tab-separated). Tracks pass@1, memory, keep/discard per commit.
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar14`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current main.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed infrastructure: sandbox, MBPP++ dataset loading, reward functions, evaluation. Do not modify.
-   - `train.py` — the file you modify. GRPO config, LoRA setup, callbacks, training loop.
-   - `configs/default.yaml` — default hyperparameters.
-4. **Verify sandbox**: Check that Docker sandbox is built (`docker images | grep coding-sandbox`). If not, tell the human to run `make sandbox`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row.
-6. **Confirm and go**: Confirm setup looks good.
-
-## Experimentation
-
-Each experiment runs on a single GPU. Launch with: `uv run train.py` or `uv run train.py --config configs/default.yaml`.
-
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game:
-  - GRPO hyperparameters (num_generations, temperature, beta, loss_type)
-  - LoRA configuration (rank, alpha, target modules)
-  - Training hyperparameters (LR, batch size, gradient accumulation)
-  - Reward mode (partial vs binary)
-  - Callbacks and monitoring
-  - vLLM settings
-
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed sandbox, MBPP++ dataset loading, reward functions, and evaluation.
-- Install new packages or add dependencies.
-- Modify the reward functions or evaluation harness.
-
-**The goal is simple: maximize pass@1 on MBPP++.** Try different GRPO configurations, LoRA settings, reward modes, etc.
-
-**Simplicity criterion**: All else being equal, simpler is better.
-
-**The first run**: Establish the baseline by running the training script as is.
-
-## Output format
-
-The training logs metrics to WandB. After training, evaluate with the evaluation functions in `prepare.py`.
-
-## Logging results
-
-Log to `results.tsv` (tab-separated):
+## How it works
 
 ```
-commit	pass_at_1	memory_gb	status	description
-```
-
-## The experiment loop
-
 LOOP FOREVER:
+  1. Read current best train.py + experiment history
+  2. Call Claude (Opus) to propose ONE focused change
+  3. Write modified train.py, git commit
+  4. Push to remote GPU, run training (5 min budget)
+  5. Parse results: pass@1 on MBPP++ test split (147 problems)
+  6. If pass@1 improved → KEEP (update best). Otherwise → DISCARD (revert to best).
+  7. Log result to results.tsv
+```
 
-1. Look at the git state
-2. Tune `train.py` with an experimental idea
-3. git commit
-4. Run: `uv run train.py > run.log 2>&1`
-5. Check results
-6. If improved, keep. If not, git reset back.
+## Running
 
-**NEVER STOP**: Once the loop begins, do NOT pause to ask the human. Continue indefinitely.
+```bash
+export ANTHROPIC_API_KEY=...
+uv run run.py                    # new branch autoresearch/<date>
+uv run run.py --tag experiment1  # custom branch name
+uv run run.py --resume           # resume on current branch
+```
+
+## What the LLM can change in train.py
+
+- GRPO hyperparameters (num_generations, temperature, beta, loss_type, scale_rewards)
+- LoRA configuration (rank, alpha, dropout, target modules)
+- Training hyperparameters (LR, batch size, gradient accumulation, warmup, weight decay)
+- Reward mode (partial vs binary), reward weights
+- Callbacks and monitoring
+- vLLM settings
+- Model choice (must fit in ~42GB VRAM with vLLM colocate)
+
+## Constraints
+
+- Do NOT modify `prepare.py` — it's fixed infrastructure
+- Do NOT add new dependencies
+- Stay within ~42GB VRAM on an 80GB A100
+- Each experiment must complete within the time budget
+- The metric is pass@1 on MBPP++ test split (147 problems)
