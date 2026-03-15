@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """Central configuration — all hyperparameters live here."""
     # Model
-    model_name: str = "Qwen/Qwen2.5-Coder-0.5B"
+    model_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 
     # LoRA
     lora_r: int = 64

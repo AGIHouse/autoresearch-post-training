@@ -669,8 +669,9 @@ def merge_adapter(model_path: str, base_model: str, output_dir: str) -> str:
 
     merged_path = os.path.abspath(os.path.join(output_dir, "merged_model"))
     if os.path.exists(merged_path):
-        logger.info(f"Merged model already exists at {merged_path}, skipping merge")
-        return merged_path
+        import shutil
+        logger.info(f"Removing stale merged model at {merged_path}")
+        shutil.rmtree(merged_path)
 
     logger.info(f"Merging adapter {model_path} into {base_model}...")
     model = AutoModelForCausalLM.from_pretrained(

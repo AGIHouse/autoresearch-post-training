@@ -3,7 +3,7 @@
 # Recommended defaults for Qwen2.5-Coder-0.5B + LoRA + GRPO.
 
 # Model
-model_name: "Qwen/Qwen2.5-Coder-0.5B"
+model_name: "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 
 # LoRA
 lora_r: 64
