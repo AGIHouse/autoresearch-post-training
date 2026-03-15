@@ -2,20 +2,16 @@
 Autonomous self-improvement loop for post-training.
 
 Uses Claude (Opus) to propose changes to train.py, runs experiments
-on a remote GPU via SSH, and keeps only improvements.
+locally, and keeps only improvements. Designed to run on the GPU machine.
 
 Usage:
     export ANTHROPIC_API_KEY=...
-    uv run run.py                    # start from scratch
-    uv run run.py --tag mar14        # custom branch tag
-    uv run run.py --resume           # resume on current branch
+    python3 -u run.py
 """
 
-import argparse
 import os
 import re
 import subprocess
-import sys
 import time
 from datetime import datetime
 
@@ -25,11 +21,9 @@ import anthropic
 # Config
 # ---------------------------------------------------------------------------
 
-GPU_HOST = "ubuntu@38.128.232.129"
-REMOTE_DIR = "autoresearch-post-training"
 TRAIN_FILE = "train.py"
 RESULTS_FILE = "results.tsv"
-RUN_TIMEOUT = 720  # 12 min max per experiment (5 min train + eval + overhead)
+RUN_TIMEOUT = 720  # 12 min max per experiment
 
 SYSTEM_PROMPT = """\
 You are an expert ML researcher optimizing GRPO post-training for a coding agent.
@@ -75,17 +69,6 @@ batch composition, loss formulation
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run(cmd, timeout=120):
-    """Run a shell command, return (stdout+stderr, returncode)."""
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-    return r.stdout + r.stderr, r.returncode
-
-
-def git_commit_hash():
-    out, _ = run("git rev-parse --short=7 HEAD")
-    return out.strip()
-
-
 def read_file(path):
     with open(path) as f:
         return f.read()
@@ -98,7 +81,7 @@ def write_file(path, content):
 
 def ensure_results_header():
     if not os.path.exists(RESULTS_FILE):
-        write_file(RESULTS_FILE, "commit\tpass_at_1\tmemory_gb\tstatus\tdescription\n")
+        write_file(RESULTS_FILE, "iteration\tpass_at_1\tmemory_gb\tstatus\tdescription\n")
 
 
 def read_results():
@@ -112,7 +95,7 @@ def find_best_pass_at_1():
     best = 0.0
     if not os.path.exists(RESULTS_FILE):
         return best
-    for line in read_file(RESULTS_FILE).strip().split("\n")[1:]:  # skip header
+    for line in read_file(RESULTS_FILE).strip().split("\n")[1:]:
         parts = line.split("\t")
         if len(parts) >= 2:
             try:
@@ -157,7 +140,6 @@ def propose_change(client, train_py, results_history, prev_log=None):
     ]
 
     if prev_log:
-        # Send last ~4000 chars of log for context (includes reward stats, eval)
         trimmed = prev_log[-4000:]
         user_parts.append(
             f"Log from the most recent experiment:\n```\n{trimmed}\n```\n"
@@ -169,7 +151,6 @@ def propose_change(client, train_py, results_history, prev_log=None):
         "Then return the COMPLETE modified train.py inside ```python ... ``` markers."
     )
 
-    # Use streaming to avoid timeout on long Opus responses
     text = ""
     with client.messages.stream(
         model="claude-opus-4-20250514",
@@ -180,12 +161,9 @@ def propose_change(client, train_py, results_history, prev_log=None):
         for chunk in stream.text_stream:
             text += chunk
 
-    # Extract explanation (everything before first code fence)
     explanation = text.split("```python")[0].strip()
-    # Keep it short for commit messages
     explanation_oneline = " ".join(explanation.replace("\n", " ").split())[:200]
 
-    # Extract code
     match = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
     if not match:
         raise ValueError("No ```python code block found in LLM response")
@@ -199,26 +177,16 @@ def propose_change(client, train_py, results_history, prev_log=None):
 # ---------------------------------------------------------------------------
 
 def run_experiment():
-    """Push code, run training on remote GPU, return output."""
-    # Push to remote (set upstream on first push)
-    print("  Pushing to remote...")
-    out, rc = run("git push -u origin HEAD", timeout=30)
-    if rc != 0:
-        # Try force push if needed (we may have reset)
-        out, rc = run("git push --force-with-lease -u origin HEAD", timeout=30)
-        if rc != 0:
-            return f"PUSH FAILED:\n{out}", rc
-
-    # Run on remote GPU
-    print("  Running on remote GPU...")
-    cmd = (
-        f'ssh {GPU_HOST} '
-        f'"cd {REMOTE_DIR} && git fetch origin && git reset --hard origin/$(git rev-parse --abbrev-ref HEAD) '
-        f'&& rm -rf outputs '
-        f'&& PATH=\\$HOME/.local/bin:\\$PATH WANDB_MODE=disabled uv run train.py --config configs/default.yaml"'
+    """Run training locally and return output."""
+    print("  Running training...")
+    r = subprocess.run(
+        ["uv", "run", "train.py", "--config", "configs/default.yaml"],
+        capture_output=True,
+        text=True,
+        timeout=RUN_TIMEOUT,
+        env={**os.environ, "WANDB_MODE": "disabled"},
     )
-    output, returncode = run(cmd, timeout=RUN_TIMEOUT)
-    return output, returncode
+    return r.stdout + r.stderr, r.returncode
 
 
 # ---------------------------------------------------------------------------
@@ -226,28 +194,12 @@ def run_experiment():
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Autonomous self-improvement loop")
-    parser.add_argument("--tag", type=str, default=None, help="Branch tag (default: today's date)")
-    parser.add_argument("--resume", action="store_true", help="Resume on current branch")
-    args = parser.parse_args()
-
     client = anthropic.Anthropic()
-
-    # Branch setup
-    if not args.resume:
-        tag = args.tag or datetime.now().strftime("%b%d").lower()
-        branch = f"autoresearch/{tag}"
-        print(f"Creating branch: {branch}")
-        run(f"git checkout -b {branch}")
-    else:
-        branch_out, _ = run("git rev-parse --abbrev-ref HEAD")
-        branch = branch_out.strip()
-        print(f"Resuming on branch: {branch}")
 
     ensure_results_header()
 
-    best_pass_at_1 = find_best_pass_at_1()
     best_train_py = read_file(TRAIN_FILE)
+    best_pass_at_1 = find_best_pass_at_1()
     prev_log = None
     iteration = 0
     consecutive_failures = 0
@@ -263,7 +215,6 @@ def main():
 
         # Always start from the best version
         write_file(TRAIN_FILE, best_train_py)
-        run(f"git add {TRAIN_FILE}")
 
         # 1. Propose change
         print("  Asking Claude for a change...")
@@ -278,17 +229,13 @@ def main():
 
         print(f"  Change: {explanation[:120]}")
 
-        # 2. Write, commit
+        # 2. Write new train.py and run
         write_file(TRAIN_FILE, new_code)
-        # Sanitize explanation for shell
-        safe_msg = explanation.replace('"', "'").replace('`', "'")[:150]
-        run(f'git add {TRAIN_FILE} && git commit -m "experiment: {safe_msg}"')
-        commit = git_commit_hash()
 
-        # 3. Run experiment
-        print(f"  Running experiment [{commit}]...")
         t0 = time.time()
         try:
+            # Clean outputs to avoid stale merge cache
+            subprocess.run(["rm", "-rf", "outputs"], check=False)
             output, returncode = run_experiment()
         except subprocess.TimeoutExpired:
             output = "TIMEOUT: experiment exceeded time limit"
@@ -296,7 +243,7 @@ def main():
         elapsed = time.time() - t0
         prev_log = output
 
-        # 4. Parse results
+        # 3. Parse results
         results = parse_output(output)
 
         if results is None or returncode != 0:
@@ -305,7 +252,6 @@ def main():
             memory_gb = 0.0
             consecutive_failures += 1
             print(f"  CRASH (took {elapsed:.0f}s, consecutive={consecutive_failures})")
-            # Print last few lines of output for debugging
             for line in output.strip().split("\n")[-5:]:
                 print(f"    {line}")
         else:
@@ -315,24 +261,22 @@ def main():
 
             if pass_at_1 > best_pass_at_1:
                 status = "keep"
+                old_best = best_pass_at_1
                 best_pass_at_1 = pass_at_1
                 best_train_py = new_code
-                print(f"  KEEP: pass@1={pass_at_1:.4f} (+{pass_at_1 - best_pass_at_1 + (pass_at_1 - best_pass_at_1):.4f}) "
+                print(f"  KEEP: pass@1={pass_at_1:.4f} (was {old_best:.4f}) "
                       f"memory={memory_gb}GB steps={results.get('steps')} ({elapsed:.0f}s)")
             else:
                 status = "discard"
+                # Restore best train.py
+                write_file(TRAIN_FILE, best_train_py)
                 print(f"  DISCARD: pass@1={pass_at_1:.4f} <= best={best_pass_at_1:.4f} "
                       f"memory={memory_gb}GB steps={results.get('steps')} ({elapsed:.0f}s)")
 
-        # 5. Log to results.tsv
+        # 4. Log to results.tsv
         with open(RESULTS_FILE, "a") as f:
             desc = explanation[:100].replace("\t", " ")
-            f.write(f"{commit}\t{pass_at_1:.6f}\t{memory_gb}\t{status}\t{desc}\n")
-
-        # 6. Reset to best if not kept
-        if status != "keep":
-            write_file(TRAIN_FILE, best_train_py)
-            run(f'git add {TRAIN_FILE} && git commit -m "revert to best ({best_pass_at_1:.4f})"')
+            f.write(f"{iteration}\t{pass_at_1:.6f}\t{memory_gb}\t{status}\t{desc}\n")
 
         # Safety: if too many consecutive crashes, pause
         if consecutive_failures >= 5:
