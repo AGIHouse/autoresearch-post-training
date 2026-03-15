@@ -51,8 +51,8 @@ reward_mode ("partial" or "binary"), reward_weights, vLLM settings, time budget
 
 ## Constraints
 - Do NOT add new imports/dependencies beyond what's in pyproject.toml
+- Do NOT change time_budget_seconds — it is set in configs/default.yaml
 - Stay within ~42GB VRAM on an 80GB A100 (training + vLLM colocate)
-- Training has a wall-clock time budget (see time_budget_seconds in config)
 - The metric is pass@1 on the 147 MBPP++ test problems
 
 ## Strategy
