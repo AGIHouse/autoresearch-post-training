@@ -1,6 +1,6 @@
 GPU_HOST := ubuntu@38.128.232.129
 
-.PHONY: ssh sandbox install train eval eval-baseline eval-trained compare test clean
+.PHONY: ssh sandbox install train run eval eval-baseline eval-trained compare test clean
 
 # SSH into the GPU instance
 ssh:
@@ -15,9 +15,14 @@ install:
 	@command -v uv >/dev/null 2>&1 || { echo "Installing uv..."; curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$$HOME/.local/bin:$$PATH"; }
 	PATH="$$HOME/.local/bin:$$PATH" uv sync --all-extras
 
-# Run GRPO training with default config
+# Run GRPO training with default config (cleans outputs first)
 train:
+	rm -rf outputs/
 	WANDB_MODE=disabled uv run train.py --config configs/default.yaml
+
+# Run autonomous self-improvement loop
+run:
+	uv run run.py
 
 # Run training with built-in defaults
 train-default:
