@@ -169,14 +169,16 @@ def propose_change(client, train_py, results_history, prev_log=None):
         "Then return the COMPLETE modified train.py inside ```python ... ``` markers."
     )
 
-    response = client.messages.create(
+    # Use streaming to avoid timeout on long Opus responses
+    text = ""
+    with client.messages.stream(
         model="claude-opus-4-20250514",
         max_tokens=16000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": "\n".join(user_parts)}],
-    )
-
-    text = response.content[0].text
+    ) as stream:
+        for chunk in stream.text_stream:
+            text += chunk
 
     # Extract explanation (everything before first code fence)
     explanation = text.split("```python")[0].strip()
